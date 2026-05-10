@@ -1,0 +1,48 @@
+
+# Thesis local data / outputs
+/data/
+/exp/
+/runs/
+/outputs/
+/output/
+/FastDDPM_Data/
+/LDCT_DATASET_V2/
+
+# Large files
+*.rar
+*.zip
+*.npy
+*.pth
+*.pt
+*.ckpt
+*.tar
+*.tar.gz
+
+# Notebook/runtime
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# Dataset / outputs
+/content/FastDDPM_Data/
+FastDDPM_Data/
+data/
+exp/
+runs/
+outputs/
+output/
+
+# Large files
+*.npy
+*.pth
+*.pt
+*.ckpt
+*.rar
+*.zip
+*.tar
+*.tar.gz
+
+# Cache
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
