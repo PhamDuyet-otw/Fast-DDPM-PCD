@@ -139,6 +139,40 @@ class Diffusion(object):
             num_workers=config.data.num_workers,
             pin_memory=True)
 
+        # Validation loader for Branch 2: use val.csv, not train.csv.
+        # Portable rule:
+        #   1) use config.data.val_dataroot if available
+        #   2) else infer val.csv from train.csv
+        #   3) else use $LDCT_DATASET_ROOT/manifests/val.csv
+        val_loader = None
+        if self.args.dataset == 'LDFDCT':
+            try:
+                val_dataroot = getattr(self.config.data, 'val_dataroot', None)
+
+                if val_dataroot is None:
+                    train_dataroot = str(self.config.data.train_dataroot)
+                    if train_dataroot.endswith('train.csv'):
+                        val_dataroot = os.path.join(os.path.dirname(train_dataroot), 'val.csv')
+                    else:
+                        dataset_root = os.environ.get('LDCT_DATASET_ROOT', None)
+                        if dataset_root is not None:
+                            val_dataroot = os.path.join(dataset_root, 'manifests', 'val.csv')
+                        else:
+                            val_dataroot = train_dataroot
+
+                val_dataset = LDFDCT(val_dataroot, self.config.data.image_size, split='val')
+                val_loader = data.DataLoader(
+                    val_dataset,
+                    batch_size=1,
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=True)
+                print('Validation set loaded for LDFDCT: {} samples.'.format(len(val_dataset)))
+                print('Validation manifest:', val_dataroot)
+            except Exception as exc:
+                logging.warning('Could not create validation loader: {}'.format(exc))
+                val_loader = None
+
         model = Model(config)
         model = model.to(self.device)
         model = torch.nn.DataParallel(model)
@@ -162,6 +196,11 @@ class Diffusion(object):
             step = states[3]
             if self.config.model.ema:
                 ema_helper.load_state_dict(states[4])
+
+        best_psnr = -1.0
+        best_ssim = -1.0
+        max_val_batches = getattr(self.config.training, 'validation_num_batches', 8)
+        n_iters = getattr(self.config.training, 'n_iters', None)
 
         for epoch in range(start_epoch, self.config.training.n_epochs):
             for i, x in enumerate(train_loader):
@@ -222,20 +261,42 @@ class Diffusion(object):
                     ema_helper.update(model)
 
                 if step % self.config.training.snapshot_freq == 0 or step == 1:
-                    states = [
-                        model.state_dict(),
-                        optimizer.state_dict(),
-                        epoch,
-                        step,
-                    ]
-                    if self.config.model.ema:
-                        states.append(ema_helper.state_dict())
-
+                    states = self._make_training_state(model, optimizer, epoch, step, ema_helper)
                     torch.save(
                         states,
                         os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
                     )
                     torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
+                    torch.save(states, os.path.join(self.args.log_path, "latest.pth"))
+
+                validation_freq = getattr(self.config.training, 'validation_freq', 0)
+                if val_loader is not None and validation_freq > 0 and step % validation_freq == 0:
+                    val_psnr, val_ssim = self._validate_sg(model, val_loader, max_batches=max_val_batches)
+
+                    tb_logger.add_scalar("val/psnr", val_psnr, global_step=step)
+                    tb_logger.add_scalar("val/ssim", val_ssim, global_step=step)
+
+                    logging.info(
+                        f"validation step: {step}, val_psnr: {val_psnr:.6f}, val_ssim: {val_ssim:.6f}"
+                    )
+                    print(f"[VAL] step={step} PSNR={val_psnr:.6f} SSIM={val_ssim:.6f}")
+
+                    states = self._make_training_state(model, optimizer, epoch, step, ema_helper)
+
+                    if val_psnr > best_psnr:
+                        best_psnr = val_psnr
+                        torch.save(states, os.path.join(self.args.log_path, "best_psnr.pth"))
+                        logging.info(f"Saved best_psnr.pth at step {step} with PSNR {best_psnr:.6f}")
+
+                    if val_ssim > best_ssim:
+                        best_ssim = val_ssim
+                        torch.save(states, os.path.join(self.args.log_path, "best_ssim.pth"))
+                        logging.info(f"Saved best_ssim.pth at step {step} with SSIM {best_ssim:.6f}")
+
+                if n_iters is not None and step >= n_iters:
+                    logging.info(f"Reached n_iters={n_iters}. Stop training at step={step}.")
+                    print(f"Reached n_iters={n_iters}. Stop training at step={step}.")
+                    return
                     
 
     # Training Fast-DDPM for tasks that have two conditions: multi image super-resolution.
@@ -931,6 +992,67 @@ class Diffusion(object):
             x = x[0][-1]
         return x
 
+
+
+    def _make_training_state(self, model, optimizer, epoch, step, ema_helper):
+        states = [
+            model.state_dict(),
+            optimizer.state_dict(),
+            epoch,
+            step,
+        ]
+        if self.config.model.ema:
+            states.append(ema_helper.state_dict())
+        return states
+
+    def _to_01(self, x):
+        # Dataset/model tensors are expected in [-1, 1].
+        return torch.clamp((x.detach() + 1.0) / 2.0, 0.0, 1.0)
+
+    def _psnr_batch(self, pred, target):
+        # Metric computation is done on CPU to avoid cuda/cpu mismatch.
+        pred = self._to_01(pred).detach().cpu()
+        target = self._to_01(target).detach().cpu()
+        mse = torch.mean((pred - target) ** 2, dim=(1, 2, 3))
+        psnr = 10.0 * torch.log10(1.0 / torch.clamp(mse, min=1e-12))
+        return psnr.mean().item()
+
+    def _ssim_batch(self, pred, target):
+        # Lightweight validation SSIM using skimage on a small validation subset.
+        from skimage.metrics import structural_similarity as ssim_fn
+        pred = self._to_01(pred).detach().cpu().numpy()
+        target = self._to_01(target).detach().cpu().numpy()
+
+        vals = []
+        for i in range(pred.shape[0]):
+            p_img = pred[i, 0]
+            t_img = target[i, 0]
+            vals.append(ssim_fn(t_img, p_img, data_range=1.0))
+        return float(sum(vals) / max(len(vals), 1))
+
+    def _validate_sg(self, model, val_loader, max_batches=None):
+        model.eval()
+        psnr_vals, ssim_vals = [], []
+
+        with torch.no_grad():
+            for batch_idx, x in enumerate(val_loader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+
+                x_img = x['LD'].to(self.device)
+                x_gt = x['FD'].to(self.device)
+
+                # Start Fast-DDPM sampling from Gaussian noise, conditioned on LDCT.
+                x_noise = torch.randn_like(x_gt)
+                x_pred = self.sg_sample_image(x_noise, x_img, model, last=True)
+
+                psnr_vals.append(self._psnr_batch(x_pred, x_gt))
+                ssim_vals.append(self._ssim_batch(x_pred, x_gt))
+
+        model.train()
+        mean_psnr = float(sum(psnr_vals) / max(len(psnr_vals), 1))
+        mean_ssim = float(sum(ssim_vals) / max(len(ssim_vals), 1))
+        return mean_psnr, mean_ssim
 
     def test(self):
         pass
