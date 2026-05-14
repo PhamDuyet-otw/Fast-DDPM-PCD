@@ -1,9 +1,9 @@
 data:
     dataset: "LDFDCT"
 
-    train_dataroot: "/content/FastDDPM_Data/manifests/train.csv"
-    val_dataroot: "/content/FastDDPM_Data/manifests/val.csv"
-    sample_dataroot: "/content/FastDDPM_Data/manifests/test.csv"
+    train_dataroot: "/workspace/FastDDPM_Data/manifests/train.csv"
+    val_dataroot: "/workspace/FastDDPM_Data/manifests/val.csv"
+    sample_dataroot: "/workspace/FastDDPM_Data/manifests/test.csv"
 
     image_size: 256
     channels: 1
@@ -36,9 +36,9 @@ diffusion:
     num_diffusion_timesteps: 1000
 
 training:
-    batch_size: 1
-    n_epochs: 1
-    n_iters: 60
+    batch_size: 6
+    n_epochs: 999999
+    n_iters: 150
     snapshot_freq: 30
     validation_freq: 30
     validation_num_batches: 2

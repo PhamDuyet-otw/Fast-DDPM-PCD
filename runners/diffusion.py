@@ -22,6 +22,10 @@ from functions.ckpt_util import get_ckpt_path
 from skimage.metrics import structural_similarity as ssim
 import torchvision.utils as tvu
 import torchvision
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 from PIL import Image
 
 
@@ -79,8 +83,16 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
         raise NotImplementedError(beta_schedule)
     assert betas.shape == (num_diffusion_timesteps,)
     return betas
+def ddp_is_on(args):
+    return getattr(args, "distributed", False)
 
 
+def ddp_is_main(args):
+    return (not ddp_is_on(args)) or getattr(args, "rank", 0) == 0
+def ddp_is_on(args):
+    return getattr(args, "distributed", False)
+def ddp_is_main(args):
+    return (not ddp_is_on(args)) or getattr(args, "rank", 0) == 0
 class Diffusion(object):
     def __init__(self, args, config, device=None):
         self.args = args
@@ -132,12 +144,26 @@ class Diffusion(object):
             print('Start training your Fast-DDPM model on BRATS dataset.')
         print('The scheduler sampling type is {}. The number of involved time steps is {} out of 1000.'.format(self.args.scheduler_type, self.args.timesteps))
         
+        # Thiết lập Sampler cho DDP
+        train_sampler = DistributedSampler(
+            dataset,
+            num_replicas=self.args.world_size,
+            rank=self.args.rank,
+            shuffle=True,
+            drop_last=True
+        ) if (hasattr(self.args, 'world_size') and self.args.world_size > 1) else None
+
+        # Khởi tạo Loader
         train_loader = data.DataLoader(
             dataset,
-            batch_size=config.training.batch_size,
-            shuffle=True,
-            num_workers=config.data.num_workers,
-            pin_memory=True)
+            batch_size=self.config.training.batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=self.config.data.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=(self.config.data.num_workers > 0)
+        )
 
         # Validation loader for Branch 2: use val.csv, not train.csv.
         # Portable rule:
@@ -145,7 +171,7 @@ class Diffusion(object):
         #   2) else infer val.csv from train.csv
         #   3) else use $LDCT_DATASET_ROOT/manifests/val.csv
         val_loader = None
-        if self.args.dataset == 'LDFDCT':
+        if self.args.dataset == 'LDFDCT' and ddp_is_main(args):
             try:
                 val_dataroot = getattr(self.config.data, 'val_dataroot', None)
 
@@ -175,7 +201,16 @@ class Diffusion(object):
 
         model = Model(config)
         model = model.to(self.device)
-        model = torch.nn.DataParallel(model)
+
+        if ddp_is_on(args):
+            model = DDP(
+            model,
+                device_ids=[args.local_rank],
+                output_device=args.local_rank,
+                find_unused_parameters=False
+            )
+        else:
+            model = torch.nn.DataParallel(model)
 
         optimizer = get_optimizer(self.config, model.parameters())
 
@@ -187,22 +222,50 @@ class Diffusion(object):
 
         start_epoch, step = 0, 0
         if self.args.resume_training:
-            states = torch.load(os.path.join(self.args.log_path, "ckpt.pth"))
-            model.load_state_dict(states[0])
+            ckpt_path = os.path.join(self.args.log_path, "ckpt.pth")
+            states = torch.load(ckpt_path, map_location="cpu")
+
+            # Load model state an toàn cho cả DDP và non-DDP
+            raw_model = model.module if hasattr(model, "module") else model
+            model_state = states[0]
+
+            # Nếu checkpoint cũ lưu từ DDP có prefix "module.", bỏ prefix đi
+            if any(k.startswith("module.") for k in model_state.keys()):
+                model_state = {
+                    k.replace("module.", "", 1): v
+                    for k, v in model_state.items()
+                }
+
+            raw_model.load_state_dict(model_state, strict=True)
 
             states[1]["param_groups"][0]["eps"] = self.config.optim.eps
             optimizer.load_state_dict(states[1])
+
+            # Đưa optimizer state về đúng GPU của từng rank
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        state[k] = v.to(self.device)
+
             start_epoch = states[2]
             step = states[3]
-            if self.config.model.ema:
+
+            if self.config.model.ema and ema_helper is not None:
                 ema_helper.load_state_dict(states[4])
 
+            del states
+            torch.cuda.empty_cache()
+
+            if ddp_is_main(args):
+                logging.info(f"Resumed training from {ckpt_path} at step={step}, epoch={start_epoch}")
         best_psnr = -1.0
         best_ssim = -1.0
         max_val_batches = getattr(self.config.training, 'validation_num_batches', 8)
         n_iters = getattr(self.config.training, 'n_iters', None)
 
         for epoch in range(start_epoch, self.config.training.n_epochs):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             for i, x in enumerate(train_loader):
                 n = x['LD'].size(0)
                 model.train()
@@ -240,11 +303,11 @@ class Diffusion(object):
 
                 loss = loss_registry[config.model.type](model, x_img, x_gt, t, e, b)
 
-                tb_logger.add_scalar("loss", loss, global_step=step)
-
-                logging.info(
-                    f"step: {step}, loss: {loss.item()}"
-                )
+                if ddp_is_main(args):
+                    tb_logger.add_scalar("loss", loss.item(), global_step=step)
+                    if ddp_is_main(args):
+                        logging.info(f"step: {step}, loss: {loss.item()}")
+                        tb_logger.add_scalar("loss", loss.item(), global_step=step)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -260,7 +323,7 @@ class Diffusion(object):
                 if self.config.model.ema:
                     ema_helper.update(model)
 
-                if step % self.config.training.snapshot_freq == 0 or step == 1:
+                if ddp_is_main(args) and (step % self.config.training.snapshot_freq == 0 or step == 1):
                     states = self._make_training_state(model, optimizer, epoch, step, ema_helper)
                     torch.save(
                         states,
@@ -292,10 +355,41 @@ class Diffusion(object):
                         best_ssim = val_ssim
                         torch.save(states, os.path.join(self.args.log_path, "best_ssim.pth"))
                         logging.info(f"Saved best_ssim.pth at step {step} with SSIM {best_ssim:.6f}")
+                do_final_snapshot = (
+                    n_iters is not None
+                    and step >= n_iters
+                    and ddp_is_main(args)
+                )
 
+                if do_final_snapshot:
+                    raw_model = model.module if hasattr(model, "module") else model
+
+                    states = [
+                        raw_model.state_dict(),
+                        optimizer.state_dict(),
+                        epoch,
+                        step,
+                    ]
+
+                    if self.config.model.ema:
+                        states.append(ema_helper.state_dict())
+
+                    torch.save(
+                        states,
+                        os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
+                    )
+                    torch.save(
+                        states,
+                        os.path.join(self.args.log_path, "ckpt.pth"),
+                    )
+
+                    logging.info(f"Saved final checkpoint at step {step}")
+
+                if ddp_is_on(args) and n_iters is not None and step >= n_iters:
+                    dist.barrier()
                 if n_iters is not None and step >= n_iters:
-                    logging.info(f"Reached n_iters={n_iters}. Stop training at step={step}.")
-                    print(f"Reached n_iters={n_iters}. Stop training at step={step}.")
+                    if ddp_is_main(args):
+                        logging.info(f"Reached n_iters={n_iters}. Stop training at step={step}.")
                     return
                     
 
@@ -397,13 +491,20 @@ class Diffusion(object):
                 if self.config.model.ema:
                     ema_helper.update(model)
 
-                if step % self.config.training.snapshot_freq == 0 or step == 1:
+                do_snapshot = (
+                    step % self.config.training.snapshot_freq == 0 or step == 1
+                )
+
+                if ddp_is_main(args) and do_snapshot:
+                    raw_model = model.module if hasattr(model, "module") else model
+
                     states = [
-                        model.state_dict(),
+                        raw_model.state_dict(),
                         optimizer.state_dict(),
                         epoch,
                         step,
                     ]
+
                     if self.config.model.ema:
                         states.append(ema_helper.state_dict())
 
@@ -411,8 +512,15 @@ class Diffusion(object):
                         states,
                         os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
                     )
-                    torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
+                    torch.save(
+                        states,
+                        os.path.join(self.args.log_path, "ckpt.pth"),
+                    )
 
+                    logging.info(f"Saved checkpoint at step {step}")
+
+                if ddp_is_on(args) and do_snapshot:
+                    dist.barrier()
     
     # Training original DDPM for tasks that have only one condition: image translation and CT denoising.
     def sg_ddpm_train(self):
@@ -499,13 +607,19 @@ class Diffusion(object):
                 if self.config.model.ema:
                     ema_helper.update(model)
 
-                if step % self.config.training.snapshot_freq == 0 or step == 1:
+                do_snapshot = (
+                    step % self.config.training.snapshot_freq == 0 or step == 1)
+
+                if ddp_is_main(args) and do_snapshot:
+                    raw_model = model.module if hasattr(model, "module") else model
+
                     states = [
-                        model.state_dict(),
+                        raw_model.state_dict(),
                         optimizer.state_dict(),
                         epoch,
                         step,
                     ]
+
                     if self.config.model.ema:
                         states.append(ema_helper.state_dict())
 
@@ -513,9 +627,15 @@ class Diffusion(object):
                         states,
                         os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
                     )
-                    torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
+                    torch.save(
+                        states,
+                        os.path.join(self.args.log_path, "ckpt.pth"),
+                    )
 
+                    logging.info(f"Saved checkpoint at step {step}")
 
+                if ddp_is_on(args) and do_snapshot:
+                    dist.barrier()
     # Training original DDPM for tasks that have two conditions: multi image super-resolution.
     def sr_ddpm_train(self):
         args, config = self.args, self.config

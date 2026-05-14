@@ -1,55 +1,60 @@
-import torch.nn as nn
-
-"""
-A method that increases the stability of a model’s convergence and helps it reach a better overall solution by preventing convergence to a local minima. 
-To avoid drastic changes in the model’s weights during training, a copy of the current weights is created before updating the model’s weights. 
-Then the model’s weights are updated to be the weighted average between the current weights and the post-optimization step weights.
-"""
+import copy
+import torch
 
 
-class EMAHelper(object):
+class EMAHelper:
     def __init__(self, mu=0.999):
         self.mu = mu
         self.shadow = {}
 
     def register(self, module):
-        if isinstance(module, nn.DataParallel):
-            module = module.module
+        self.shadow = {}
         for name, param in module.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+                self.shadow[name] = param.detach().clone().to(param.device)
 
     def update(self, module):
-        if isinstance(module, nn.DataParallel):
-            module = module.module
         for name, param in module.named_parameters():
-            if param.requires_grad:
-                self.shadow[name].data = (
-                    1. - self.mu) * param.data + self.mu * self.shadow[name].data
+            if not param.requires_grad:
+                continue
+
+            p = param.detach()
+
+            if name not in self.shadow:
+                self.shadow[name] = p.clone().to(p.device)
+                continue
+
+            # Fix DDP resume:
+            # rank 0 dùng cuda:0, rank 1 dùng cuda:1.
+            # EMA shadow có thể được load từ checkpoint về cuda:0/CPU,
+            # nên cần ép về đúng device của param hiện tại.
+            shadow = self.shadow[name].detach().to(device=p.device, dtype=p.dtype)
+
+            shadow.mul_(self.mu)
+            shadow.add_(p, alpha=1.0 - self.mu)
+
+            self.shadow[name] = shadow
 
     def ema(self, module):
-        if isinstance(module, nn.DataParallel):
-            module = module.module
         for name, param in module.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.shadow[name].data)
+            if param.requires_grad and name in self.shadow:
+                param.data.copy_(
+                    self.shadow[name].to(device=param.device, dtype=param.dtype).data
+                )
 
     def ema_copy(self, module):
-        if isinstance(module, nn.DataParallel):
-            inner_module = module.module
-            module_copy = type(inner_module)(
-                inner_module.config).to(inner_module.config.device)
-            module_copy.load_state_dict(inner_module.state_dict())
-            module_copy = nn.DataParallel(module_copy)
-        else:
-            module_copy = type(module)(module.config).to(module.config.device)
-            module_copy.load_state_dict(module.state_dict())
-        # module_copy = copy.deepcopy(module)
+        module_copy = copy.deepcopy(module)
+        module_copy.load_state_dict(module.state_dict())
         self.ema(module_copy)
         return module_copy
 
     def state_dict(self):
-        return self.shadow
+        # Save EMA về CPU để resume sạch trên 1 GPU / 2 GPU / GPU khác.
+        return {k: v.detach().cpu() for k, v in self.shadow.items()}
 
     def load_state_dict(self, state_dict):
         self.shadow = state_dict
+
+
+# Giữ alias phòng khi chỗ khác import EMA
+EMA = EMAHelper
