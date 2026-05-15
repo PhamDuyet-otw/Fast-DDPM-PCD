@@ -985,11 +985,18 @@ class Diffusion(object):
                 x = x.squeeze().float().cpu().numpy()
                 x_gt = x_gt*255
                 x = x*255
+                x = np.asarray(x)
+                x_gt = np.asarray(x_gt)
 
+                if x.ndim == 2:
+                    x = x[None, :, :]
+
+                if x_gt.ndim == 2:
+                    x_gt = x_gt[None, :, :]
                 PSNR = 0.0 
                 SSIM = 0.0
                 for i in range(x.shape[0]):
-                    psnr_temp = calculate_psnr(x[i,:,:], x_gt[i,:,:])
+                    psnr_temp = calculate_psnr(x[i] if x.ndim == 3 else x, x_gt[i] if x_gt.ndim == 3 else x_gt)
                     ssim_temp = ssim(x_gt[i,:,:], x[i,:,:], data_range=255)
                     PSNR += psnr_temp
                     SSIM += ssim_temp

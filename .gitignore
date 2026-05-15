@@ -46,3 +46,16 @@ output/
 __pycache__/
 .ipynb_checkpoints/
 *.pyc
+
+# Local data / experiments / checkpoints
+FastDDPM_Data/
+FastDDPM_Experiments/
+venvs/
+*.pth
+*.pt
+*.ckpt
+*.log
+*.rar
+*.bak*
+*.pyc
+__pycache__/

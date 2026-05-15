@@ -1,0 +1,63 @@
+data:
+  dataset: LDFDCT
+  train_dataroot: /workspace/FastDDPM_Data/manifests/train.csv
+  val_dataroot: /workspace/FastDDPM_Data/manifests/val.csv
+  sample_dataroot: /workspace/FastDDPM_Data/manifests/test.csv
+  image_size: 256
+  channels: 1
+  logit_transform: false
+  uniform_dequantization: false
+  gaussian_dequantization: false
+  random_flip: true
+  rescaled: true
+  num_workers: 2
+model:
+  type: sg
+  in_channels: 2
+  out_ch: 1
+  ch: 128
+  ch_mult:
+  - 1
+  - 1
+  - 2
+  - 2
+  - 4
+  - 4
+  num_res_blocks: 2
+  attn_resolutions:
+  - 16
+  dropout: 0.0
+  var_type: fixedsmall
+  ema_rate: 0.999
+  ema: true
+  resamp_with_conv: true
+diffusion:
+  beta_schedule: linear
+  beta_start: 0.0001
+  beta_end: 0.02
+  num_diffusion_timesteps: 1000
+training:
+  batch_size: 6
+  n_epochs: 999999
+  n_iters: 400000
+  snapshot_freq: 50000
+  validation_freq: 50000
+  validation_num_batches: 2
+sampling:
+  batch_size: 1
+  ckpt_id:
+  - 500
+  last_only: true
+sampling_inter:
+  batch_size: 1
+  last_only: true
+sampling_fid:
+  batch_size: 1
+  last_only: true
+optim:
+  weight_decay: 0.0
+  optimizer: Adam
+  lr: 2.0e-05
+  beta1: 0.9
+  amsgrad: false
+  eps: 1.0e-08
