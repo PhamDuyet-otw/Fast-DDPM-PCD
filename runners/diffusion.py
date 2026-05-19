@@ -136,7 +136,7 @@ class Diffusion(object):
         
         if self.args.dataset=='LDFDCT':
             # LDFDCT for CT image denoising
-            dataset = LDFDCT(self.config.data.train_dataroot, self.config.data.image_size, split='train')
+            dataset = LDFDCT(self.config.data.train_dataroot, self.config.data.image_size, split='train', config=self.config)
             print('Start training your Fast-DDPM model on LDFDCT dataset.')
         elif self.args.dataset=='BRATS':
             # BRATS for brain image translation
@@ -186,7 +186,7 @@ class Diffusion(object):
                         else:
                             val_dataroot = train_dataroot
 
-                val_dataset = LDFDCT(val_dataroot, self.config.data.image_size, split='val')
+                val_dataset = LDFDCT(val_dataroot, self.config.data.image_size, split='val', config=self.config)
                 val_loader = data.DataLoader(
                     val_dataset,
                     batch_size=1,
@@ -274,34 +274,30 @@ class Diffusion(object):
                 x_img = x['LD'].to(self.device)
                 x_gt = x['FD'].to(self.device)
 
-                e = torch.randn_like(x_gt)
                 b = self.betas
 
-                if self.args.scheduler_type == 'uniform':
-                    skip = self.num_timesteps // self.args.timesteps
-                    t_intervals = torch.arange(-1, self.num_timesteps, skip)
-                    t_intervals[0] = 0
-                elif self.args.scheduler_type == 'non-uniform':
-                    t_intervals = torch.tensor([0, 199, 399, 599, 699, 799, 849, 899, 949, 999])
-                    
-                    if self.args.timesteps != 10:
-                        num_1 = int(self.args.timesteps*0.4)
-                        num_2 = int(self.args.timesteps*0.6)
-                        stage_1 = torch.linspace(0, 699, num_1+1)[:-1]
-                        stage_2 = torch.linspace(699, 999, num_2)
-                        stage_1 = torch.ceil(stage_1).long()
-                        stage_2 = torch.ceil(stage_2).long()
-                        t_intervals = torch.cat((stage_1, stage_2))
-                else:
-                    raise Exception("The scheduler type is either uniform or non-uniform.")
-                    
-                #  antithetic sampling
-                idx_1 = torch.randint(0, len(t_intervals), size=(n // 2 + 1,))
-                idx_2 = len(t_intervals)-idx_1-1
-                idx = torch.cat([idx_1, idx_2], dim=0)[:n]
-                t = t_intervals[idx].to(self.device)
+                # Create timestep tensor using antithetic pairing as specified
+                t = torch.randint(
+                    low=0,
+                    high=self.num_timesteps,
+                    size=(x_gt.shape[0] // 2 + 1,),
+                    device=self.device,
+                )
+                t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:x_gt.shape[0]]
+                t = t.long()
+
+                # Create noise tensor matching the target shape
+                e = torch.randn_like(x_gt)
 
                 loss = loss_registry[config.model.type](model, x_img, x_gt, t, e, b)
+
+                # Debug logging for 2.5D mode (one-time only)
+                if not hasattr(self, '_debug_25d_logged') and hasattr(config.data, 'input_mode') and config.data.input_mode == '2.5d':
+                    logging.info(f"[2.5D DEBUG] x_img (condition) shape: {x_img.shape}, min: {x_img.min():.4f}, max: {x_img.max():.4f}")
+                    logging.info(f"[2.5D DEBUG] x_gt (target) shape: {x_gt.shape}, min: {x_gt.min():.4f}, max: {x_gt.max():.4f}")
+                    model_input = torch.cat([x_img, x_gt], dim=1)
+                    logging.info(f"[2.5D DEBUG] model input shape (concatenated): {model_input.shape}, min: {model_input.min():.4f}, max: {model_input.max():.4f}")
+                    self._debug_25d_logged = True
 
                 if ddp_is_main(args):
                     tb_logger.add_scalar("loss", loss.item(), global_step=step)
@@ -529,7 +525,7 @@ class Diffusion(object):
 
         if self.args.dataset=='LDFDCT':
             # LDFDCT for CT image denoising
-            dataset = LDFDCT(self.config.data.train_dataroot, self.config.data.image_size, split='train')
+            dataset = LDFDCT(self.config.data.train_dataroot, self.config.data.image_size, split='train', config=self.config)
             print('Start training DDPM model on LDFDCT dataset.')
         elif self.args.dataset=='BRATS':
             # BRATS for brain image translation
@@ -936,7 +932,7 @@ class Diffusion(object):
 
         if self.args.dataset=='LDFDCT':
             # LDFDCT for CT image denoising
-            sample_dataset = LDFDCT(self.config.data.sample_dataroot, self.config.data.image_size, split='calculate')
+            sample_dataset = LDFDCT(self.config.data.sample_dataroot, self.config.data.image_size, split='calculate', config=self.config)
             print('Start training model on LDFDCT dataset.')
         elif self.args.dataset=='BRATS':
             # BRATS for brain image translation

@@ -1,0 +1,79 @@
+data:
+  dataset: "LDFDCT"
+
+  data_root: "/workspace/FastDDPM_Data"
+  train_manifest: "/workspace/FastDDPM_Data/02_manifests/train_v3.csv"
+  val_manifest: "/workspace/FastDDPM_Data/02_manifests/val_v3.csv"
+  test_manifest: "/workspace/FastDDPM_Data/02_manifests/test_v3.csv"
+  npy_root: "/workspace/FastDDPM_Data/01_processed_npy_512"
+
+  image_size: 256
+  original_size: 512
+  channels: 1
+  num_workers: 2
+
+  use_hu_npy: true
+  hu_window_min: -1000
+  hu_window_max: 400
+  normalize: "minus_one_to_one"
+
+  input_mode: "2.5d"
+  condition_slices: 3
+  slice_offsets: [-1, 0, 1]
+  drop_boundary_slices: true
+
+  train_crop: "random"
+  val_crop: "center"
+  test_crop: "center"
+
+  random_flip: false
+  centered: true
+  rescaled: true
+  logit_transform: false
+  uniform_dequantization: false
+  gaussian_dequantization: false
+
+model:
+  type: "simple"
+  ema: true
+  ema_rate: 0.9999
+
+  in_channels: 4
+  out_ch: 1
+
+  ch: 128
+  ch_mult: [1, 1, 2, 2, 4, 4]
+  num_res_blocks: 2
+  attn_resolutions: [16]
+  dropout: 0.0
+  var_type: "fixedlarge"
+  resamp_with_conv: true
+
+diffusion:
+  beta_schedule: "linear"
+  beta_start: 0.0001
+  beta_end: 0.02
+  num_diffusion_timesteps: 1000
+
+training:
+  batch_size: 1
+  n_iters: 20
+  n_epochs: 100000
+  snapshot_freq: 10
+  validation_freq: 10
+  log_freq: 1
+  resume_training: true
+  save_best: true
+
+sampling:
+  batch_size: 1
+  last_only: true
+
+optim:
+  weight_decay: 0.000
+  optimizer: "Adam"
+  lr: 0.0002
+  beta1: 0.9
+  amsgrad: false
+  eps: 0.00000001
+  grad_clip: 1.0
