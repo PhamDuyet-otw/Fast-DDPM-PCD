@@ -1,0 +1,83 @@
+data:
+  dataset: LDFDCT
+  train_dataroot: /workspace/FastDDPM_Data/02_manifests/train_v3.csv
+  val_dataroot: /workspace/FastDDPM_Data/02_manifests/val_v3.csv
+  sample_dataroot: /workspace/FastDDPM_Data/manifests/test.csv
+  image_size: 256
+  channels: 1
+  logit_transform: false
+  uniform_dequantization: false
+  gaussian_dequantization: false
+  random_flip: true
+  rescaled: true
+  num_workers: 8
+  data_root: /workspace/FastDDPM_Data
+  train_manifest: /workspace/FastDDPM_Dummy_Data/02_manifests/train_v3.csv
+  val_manifest: /workspace/FastDDPM_Dummy_Data/02_manifests/val_v3.csv
+  test_manifest: /workspace/FastDDPM_Dummy_Data/02_manifests/test_v3.csv
+  crop_size: 256
+  test_dataroot: /workspace/FastDDPM_Data/02_manifests/test_v3.csv
+  use_hu_npy: true
+  hu_window_min: -1000
+  hu_window_max: 400
+  normalize: minus_one_to_one
+  pin_memory: true
+  persistent_workers: true
+  input_mode: 2.5d
+  condition_mode: 2.5d
+  num_condition_slices: 3
+  slice_offsets:
+  - -1
+  - 0
+  - 1
+model:
+  type: sg
+  in_channels: 4
+  out_ch: 1
+  ch: 128
+  ch_mult:
+  - 1
+  - 1
+  - 2
+  - 2
+  - 4
+  - 4
+  num_res_blocks: 2
+  attn_resolutions:
+  - 16
+  dropout: 0.0
+  var_type: fixedsmall
+  ema_rate: 0.999
+  ema: true
+  resamp_with_conv: true
+diffusion:
+  beta_schedule: linear
+  beta_start: 0.0001
+  beta_end: 0.02
+  num_diffusion_timesteps: 1000
+training:
+  batch_size: 8
+  n_epochs: 999999
+  n_iters: 200
+  snapshot_freq: 100
+  validation_freq: 100
+  validation_num_batches: 2
+  loss_type: simple_conditional
+sampling:
+  batch_size: 2
+  ckpt_id:
+  - 500
+  last_only: true
+sampling_inter:
+  batch_size: 2
+  last_only: true
+sampling_fid:
+  batch_size: 2
+  last_only: true
+optim:
+  weight_decay: 0.0
+  optimizer: Adam
+  lr: 2.0e-05
+  beta1: 0.9
+  amsgrad: false
+  eps: 1.0e-08

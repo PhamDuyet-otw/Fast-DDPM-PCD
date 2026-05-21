@@ -295,8 +295,8 @@ class Diffusion(object):
                 if not hasattr(self, '_debug_25d_logged') and hasattr(config.data, 'input_mode') and config.data.input_mode == '2.5d':
                     logging.info(f"[2.5D DEBUG] x_img (condition) shape: {x_img.shape}, min: {x_img.min():.4f}, max: {x_img.max():.4f}")
                     logging.info(f"[2.5D DEBUG] x_gt (target) shape: {x_gt.shape}, min: {x_gt.min():.4f}, max: {x_gt.max():.4f}")
-                    model_input = torch.cat([x_img, x_gt], dim=1)
-                    logging.info(f"[2.5D DEBUG] model input shape (concatenated): {model_input.shape}, min: {model_input.min():.4f}, max: {model_input.max():.4f}")
+                    model_input = torch.cat([x_gt, x_img], dim=1)
+                    logging.info(f"[2.5D DEBUG] model input shape [target/noisy, condition]: {model_input.shape}, min: {model_input.min():.4f}, max: {model_input.max():.4f}")
                     self._debug_25d_logged = True
 
                 if ddp_is_main(args):

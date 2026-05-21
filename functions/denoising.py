@@ -146,7 +146,7 @@ def sg_generalized_steps(x, x_img, seq, model, b, **kwargs):
             at = compute_alpha(b, t.long())
             at_next = compute_alpha(b, next_t.long())
             xt = xs[-1].to('cuda')
-            et = model(torch.cat([x_img, xt], dim=1), t)
+            et = model(torch.cat([xt, x_img], dim=1), t)
 
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
             x0_preds.append(x0_t.to('cpu'))
@@ -177,7 +177,7 @@ def sg_ddpm_steps(x, x_img, seq, model, b, **kwargs):
             beta_t = 1 - at / atm1
             x = xs[-1].to('cuda')
 
-            output = model(torch.cat([x_img, x], dim=1), t.float())
+            output = model(torch.cat([x, x_img], dim=1), t.float())
             e = output
 
             x0_from_e = (1.0 / at).sqrt() * x - (1.0 / at - 1).sqrt() * e
