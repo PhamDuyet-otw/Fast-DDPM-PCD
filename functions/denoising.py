@@ -149,6 +149,7 @@ def sg_generalized_steps(x, x_img, seq, model, b, **kwargs):
             et = model(torch.cat([xt, x_img], dim=1), t)
 
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
+            x0_t = torch.clamp(x0_t, -1, 1)
             x0_preds.append(x0_t.to('cpu'))
             # Equation (12)
             c1 = (

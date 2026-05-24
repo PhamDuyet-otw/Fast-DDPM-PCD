@@ -29,6 +29,38 @@ import torch.distributed as dist
 from PIL import Image
 
 
+def load_state_dict_flexible(model, state_dict):
+    # Determine the raw model (unwrapped from DataParallel / DDP)
+    raw_model = model.module if hasattr(model, "module") else model
+    
+    # Strip "module." prefix from state_dict keys if present
+    clean_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            clean_state_dict[k.replace("module.", "", 1)] = v
+        else:
+            clean_state_dict[k] = v
+            
+    # Load into the raw model
+    raw_model.load_state_dict(clean_state_dict, strict=True)
+
+
+def load_checkpoint_to_model(model, ckpt_path, device=None):
+    states = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(states, (list, tuple)):
+        state_dict = states[0]
+    elif isinstance(states, dict):
+        if "model" in states:
+            state_dict = states["model"]
+        else:
+            state_dict = states
+    else:
+        raise ValueError(f"Unknown checkpoint format at {ckpt_path}")
+    
+    load_state_dict_flexible(model, state_dict)
+    return states
+
+
 def torch2hwcuint8(x, clip=False):
     if clip:
         x = torch.clamp(x, -1, 1)
@@ -221,22 +253,12 @@ class Diffusion(object):
             ema_helper = None
 
         start_epoch, step = 0, 0
+        best_psnr = -1.0
+        best_ssim = -1.0
+
         if self.args.resume_training:
             ckpt_path = os.path.join(self.args.log_path, "ckpt.pth")
-            states = torch.load(ckpt_path, map_location="cpu")
-
-            # Load model state an toàn cho cả DDP và non-DDP
-            raw_model = model.module if hasattr(model, "module") else model
-            model_state = states[0]
-
-            # Nếu checkpoint cũ lưu từ DDP có prefix "module.", bỏ prefix đi
-            if any(k.startswith("module.") for k in model_state.keys()):
-                model_state = {
-                    k.replace("module.", "", 1): v
-                    for k, v in model_state.items()
-                }
-
-            raw_model.load_state_dict(model_state, strict=True)
+            states = load_checkpoint_to_model(model, ckpt_path, self.device)
 
             states[1]["param_groups"][0]["eps"] = self.config.optim.eps
             optimizer.load_state_dict(states[1])
@@ -250,16 +272,48 @@ class Diffusion(object):
             start_epoch = states[2]
             step = states[3]
 
+            # Extract best_psnr and best_ssim if present
+            if len(states) >= 7:
+                best_psnr = states[5]
+                best_ssim = states[6]
+            elif len(states) == 6 and not isinstance(states[4], dict) and states[4] is not None:
+                best_psnr = states[4]
+                best_ssim = states[5]
+
             if self.config.model.ema and ema_helper is not None:
-                ema_helper.load_state_dict(states[4])
+                if len(states) >= 5 and states[4] is not None:
+                    ema_helper.load_state_dict(states[4])
 
             del states
             torch.cuda.empty_cache()
 
             if ddp_is_main(args):
-                logging.info(f"Resumed training from {ckpt_path} at step={step}, epoch={start_epoch}")
-        best_psnr = -1.0
-        best_ssim = -1.0
+                logging.info(f"Resumed training from {ckpt_path} at step={step}, epoch={start_epoch}, best_psnr={best_psnr:.6f}, best_ssim={best_ssim:.6f}")
+
+        # Setup training timestep candidates (Fast-DDPM scheduler logic)
+        if self.args.scheduler_type == 'uniform':
+            skip = self.num_timesteps // self.args.timesteps
+            t_intervals = torch.arange(-1, self.num_timesteps, skip)
+            t_intervals[0] = 0
+        elif self.args.scheduler_type == 'non-uniform':
+            t_intervals = torch.tensor([0, 199, 399, 599, 699, 799, 849, 899, 949, 999])
+            if self.args.timesteps != 10:
+                num_1 = int(self.args.timesteps * 0.4)
+                num_2 = int(self.args.timesteps * 0.6)
+                stage_1 = np.linspace(0, 699, num_1 + 1)[:-1]
+                stage_2 = np.linspace(699, 999, num_2)
+                stage_1 = np.ceil(stage_1).astype(int)
+                stage_2 = np.ceil(stage_2).astype(int)
+                t_intervals = torch.tensor(np.concatenate((stage_1, stage_2)))
+        else:
+            raise NotImplementedError("Only uniform and non-uniform schedulers are supported.")
+
+        t_intervals = t_intervals.to(self.device).long()
+
+        if ddp_is_main(args):
+            print(f"Training timestep candidates: {t_intervals.cpu().tolist()}")
+            print(f"Number of timestep candidates: {len(t_intervals)}")
+
         max_val_batches = getattr(self.config.training, 'validation_num_batches', 8)
         n_iters = getattr(self.config.training, 'n_iters', None)
 
@@ -276,20 +330,23 @@ class Diffusion(object):
 
                 b = self.betas
 
-                # Create timestep tensor using antithetic pairing as specified
-                t = torch.randint(
+                # Create timestep tensor using antithetic pairing over the indices of t_intervals
+                num_candidates = len(t_intervals)
+                idx = torch.randint(
                     low=0,
-                    high=self.num_timesteps,
+                    high=num_candidates,
                     size=(x_gt.shape[0] // 2 + 1,),
                     device=self.device,
                 )
-                t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:x_gt.shape[0]]
-                t = t.long()
+                idx = torch.cat([idx, num_candidates - idx - 1], dim=0)[:x_gt.shape[0]]
+                t = t_intervals[idx].long()
 
                 # Create noise tensor matching the target shape
                 e = torch.randn_like(x_gt)
 
-                loss = loss_registry[config.model.type](model, x_img, x_gt, t, e, b)
+                # Loss dispatch based on training config or model type
+                loss_key = getattr(self.config.training, "loss_type", self.config.model.type)
+                loss = loss_registry[loss_key](model, x_img, x_gt, t, e, b)
 
                 # Debug logging for 2.5D mode (one-time only)
                 if not hasattr(self, '_debug_25d_logged') and hasattr(config.data, 'input_mode') and config.data.input_mode == '2.5d':
@@ -320,7 +377,7 @@ class Diffusion(object):
                     ema_helper.update(model)
 
                 if ddp_is_main(args) and (step % self.config.training.snapshot_freq == 0 or step == 1):
-                    states = self._make_training_state(model, optimizer, epoch, step, ema_helper)
+                    states = self._make_training_state(model, optimizer, epoch, step, ema_helper, best_psnr, best_ssim)
                     torch.save(
                         states,
                         os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
@@ -330,7 +387,7 @@ class Diffusion(object):
 
                 validation_freq = getattr(self.config.training, 'validation_freq', 0)
                 if val_loader is not None and validation_freq > 0 and step % validation_freq == 0:
-                    val_psnr, val_ssim = self._validate_sg(model, val_loader, max_batches=max_val_batches)
+                    val_psnr, val_ssim = self._validate_sg(model, val_loader, max_batches=max_val_batches, ema_helper=ema_helper)
 
                     tb_logger.add_scalar("val/psnr", val_psnr, global_step=step)
                     tb_logger.add_scalar("val/ssim", val_ssim, global_step=step)
@@ -340,15 +397,15 @@ class Diffusion(object):
                     )
                     print(f"[VAL] step={step} PSNR={val_psnr:.6f} SSIM={val_ssim:.6f}")
 
-                    states = self._make_training_state(model, optimizer, epoch, step, ema_helper)
-
                     if val_psnr > best_psnr:
                         best_psnr = val_psnr
+                        states = self._make_training_state(model, optimizer, epoch, step, ema_helper, best_psnr, best_ssim)
                         torch.save(states, os.path.join(self.args.log_path, "best_psnr.pth"))
                         logging.info(f"Saved best_psnr.pth at step {step} with PSNR {best_psnr:.6f}")
 
                     if val_ssim > best_ssim:
                         best_ssim = val_ssim
+                        states = self._make_training_state(model, optimizer, epoch, step, ema_helper, best_psnr, best_ssim)
                         torch.save(states, os.path.join(self.args.log_path, "best_ssim.pth"))
                         logging.info(f"Saved best_ssim.pth at step {step} with SSIM {best_ssim:.6f}")
                 do_final_snapshot = (
@@ -358,18 +415,7 @@ class Diffusion(object):
                 )
 
                 if do_final_snapshot:
-                    raw_model = model.module if hasattr(model, "module") else model
-
-                    states = [
-                        raw_model.state_dict(),
-                        optimizer.state_dict(),
-                        epoch,
-                        step,
-                    ]
-
-                    if self.config.model.ema:
-                        states.append(ema_helper.state_dict())
-
+                    states = self._make_training_state(model, optimizer, epoch, step, ema_helper, best_psnr, best_ssim)
                     torch.save(
                         states,
                         os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
@@ -740,20 +786,20 @@ class Diffusion(object):
             print('Start inference on model of {} steps'.format(ckpt_idx))
 
             if not self.args.use_pretrained:
-                states = torch.load(
-                    os.path.join(
-                        self.args.log_path, f"ckpt_{ckpt_idx}.pth"
-                    ),
-                    map_location=self.config.device,
+                ckpt_path = os.path.join(
+                    self.args.log_path, f"ckpt_{ckpt_idx}.pth"
                 )
+                states = load_checkpoint_to_model(model, ckpt_path, self.device)
                 model = model.to(self.device)
                 model = torch.nn.DataParallel(model)
-                model.load_state_dict(states[0], strict=True)
 
                 if self.config.model.ema:
                     ema_helper = EMAHelper(mu=self.config.model.ema_rate)
                     ema_helper.register(model)
-                    ema_helper.load_state_dict(states[-1])
+                    if len(states) >= 5 and isinstance(states[4], dict):
+                        ema_helper.load_state_dict(states[4])
+                    elif len(states) == 5:
+                        ema_helper.load_state_dict(states[4])
                     ema_helper.ema(model)
                 else:
                     ema_helper = None
@@ -792,20 +838,20 @@ class Diffusion(object):
             print('Start inference on model of {} steps'.format(ckpt_idx))
 
             if not self.args.use_pretrained:
-                states = torch.load(
-                    os.path.join(
-                        self.args.log_path, f"ckpt_{ckpt_idx}.pth"
-                    ),
-                    map_location=self.config.device,
+                ckpt_path = os.path.join(
+                    self.args.log_path, f"ckpt_{ckpt_idx}.pth"
                 )
+                states = load_checkpoint_to_model(model, ckpt_path, self.device)
                 model = model.to(self.device)
                 model = torch.nn.DataParallel(model)
-                model.load_state_dict(states[0], strict=True)
 
                 if self.config.model.ema:
                     ema_helper = EMAHelper(mu=self.config.model.ema_rate)
                     ema_helper.register(model)
-                    ema_helper.load_state_dict(states[-1])
+                    if len(states) >= 5 and isinstance(states[4], dict):
+                        ema_helper.load_state_dict(states[4])
+                    elif len(states) == 5:
+                        ema_helper.load_state_dict(states[4])
                     ema_helper.ema(model)
                 else:
                     ema_helper = None
@@ -1117,15 +1163,18 @@ class Diffusion(object):
 
 
 
-    def _make_training_state(self, model, optimizer, epoch, step, ema_helper):
+    def _make_training_state(self, model, optimizer, epoch, step, ema_helper, best_psnr=-1.0, best_ssim=-1.0):
+        # We always save the raw model's state dict (unwrapped from DataParallel / DDP)
+        raw_model = model.module if hasattr(model, "module") else model
         states = [
-            model.state_dict(),
+            raw_model.state_dict(),
             optimizer.state_dict(),
             epoch,
             step,
+            ema_helper.state_dict() if (self.config.model.ema and ema_helper is not None) else None,
+            best_psnr,
+            best_ssim
         ]
-        if self.config.model.ema:
-            states.append(ema_helper.state_dict())
         return states
 
     def _to_01(self, x):
@@ -1153,9 +1202,15 @@ class Diffusion(object):
             vals.append(ssim_fn(t_img, p_img, data_range=1.0))
         return float(sum(vals) / max(len(vals), 1))
 
-    def _validate_sg(self, model, val_loader, max_batches=None):
+    def _validate_sg(self, model, val_loader, max_batches=None, ema_helper=None):
         model.eval()
         psnr_vals, ssim_vals = [], []
+
+        # Apply EMA weights if available during validation
+        original_state = None
+        if ema_helper is not None:
+            original_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            ema_helper.ema(model)
 
         with torch.no_grad():
             for batch_idx, x in enumerate(val_loader):
@@ -1171,6 +1226,10 @@ class Diffusion(object):
 
                 psnr_vals.append(self._psnr_batch(x_pred, x_gt))
                 ssim_vals.append(self._ssim_batch(x_pred, x_gt))
+
+        # Restore original non-EMA weights after validation
+        if original_state is not None:
+            model.load_state_dict(original_state)
 
         model.train()
         mean_psnr = float(sum(psnr_vals) / max(len(psnr_vals), 1))

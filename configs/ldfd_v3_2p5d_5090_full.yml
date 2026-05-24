@@ -61,7 +61,7 @@ training:
   n_iters: 450000
   snapshot_freq: 10000
   validation_freq: 10000
-  validation_num_batches: 2
+  validation_num_batches: 32
   loss_type: simple_conditional
 sampling:
   batch_size: 2

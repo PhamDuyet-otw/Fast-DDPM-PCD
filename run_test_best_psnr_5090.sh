@@ -16,11 +16,11 @@ EVAL_DIR="/workspace/FastDDPM_Experiments/logs/${EVAL_DOC}"
 mkdir -p "${EVAL_DIR}"
 
 # dùng best checkpoint làm ckpt.pth để code sample load
-cp "${TRAIN_DIR}/best_psnr.pth" "${EVAL_DIR}/ckpt.pth"
+cp "${TRAIN_DIR}/best_psnr.pth" "${EVAL_DIR}/ckpt_500.pth"
 cp "${TRAIN_DIR}/config.yml" "${EVAL_DIR}/config.yml" || true
 
 echo "Using checkpoint:"
-ls -lh "${EVAL_DIR}/ckpt.pth"
+ls -lh "${EVAL_DIR}/ckpt_500.pth"
 
 python fast_ddpm_main.py \
   --config ldfd_npy_manifest_v2_full_5090_bs6.yml \

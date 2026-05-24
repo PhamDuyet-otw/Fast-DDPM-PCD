@@ -248,6 +248,8 @@ class LDFDCT(Dataset):
         self.dataroot = str(dataroot)
         self.img_size = img_size
         self.split = str(split).lower()
+        if self.split == "calculate":
+            self.split = "test"
         self.data_len_arg = data_len
         self.config = config
 
