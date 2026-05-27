@@ -59,3 +59,23 @@ venvs/
 *.bak*
 *.pyc
 __pycache__/
+
+# Local server/data artifacts
+FD
+LD
+FastDDPM_Data/
+FastDDPM_Experiments/
+FastDDPM_Samples/
+
+# Checkpoints and training outputs
+*.pth
+*.pt
+*.ckpt
+*.log
+*.tar.gz
+*.rar
+
+# Temporary local scripts/configs
+make_4090_config.py
+configs/ldfd_v3_2p5d_4090_smoke500.yml
+configs/ldfd_v3_2p5d_4090_scratch50k.yml
