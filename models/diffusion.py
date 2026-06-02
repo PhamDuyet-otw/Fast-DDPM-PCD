@@ -135,9 +135,13 @@ class ResnetBlock(nn.Module):
 
 
 class AttnBlock(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, num_heads=1):
         super().__init__()
         self.in_channels = in_channels
+        self.num_heads = num_heads
+        assert in_channels % num_heads == 0, \
+            f"in_channels ({in_channels}) must be divisible by num_heads ({num_heads})"
+        self.head_dim = in_channels // num_heads
 
         self.norm = Normalize(in_channels)
         self.q = torch.nn.Conv2d(in_channels,
@@ -170,19 +174,50 @@ class AttnBlock(nn.Module):
 
         # compute attention
         b, c, h, w = q.shape
-        q = q.reshape(b, c, h*w)
-        q = q.permute(0, 2, 1)   # b,hw,c
-        k = k.reshape(b, c, h*w)  # b,c,hw
-        w_ = torch.bmm(q, k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
-        w_ = w_ * (int(c)**(-0.5))
-        w_ = torch.nn.functional.softmax(w_, dim=2)
+        num_heads = self.num_heads
+        head_dim = self.head_dim
 
-        # attend to values
-        v = v.reshape(b, c, h*w)
-        w_ = w_.permute(0, 2, 1)   # b,hw,hw (first hw of k, second of q)
-        # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
-        h_ = torch.bmm(v, w_)
-        h_ = h_.reshape(b, c, h, w)
+        if num_heads == 1:
+            # Original single-head path (unchanged behavior)
+            q = q.reshape(b, c, h*w)
+            q = q.permute(0, 2, 1)   # b,hw,c
+            k = k.reshape(b, c, h*w)  # b,c,hw
+            w_ = torch.bmm(q, k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
+            w_ = w_ * (int(c)**(-0.5))
+            w_ = torch.nn.functional.softmax(w_, dim=2)
+
+            # attend to values
+            v = v.reshape(b, c, h*w)
+            w_ = w_.permute(0, 2, 1)   # b,hw,hw (first hw of k, second of q)
+            # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
+            h_ = torch.bmm(v, w_)
+            h_ = h_.reshape(b, c, h, w)
+        else:
+            # Multi-head attention path
+            # Reshape: (b, c, h, w) -> (b, num_heads, head_dim, h*w) -> (b*num_heads, head_dim, h*w)
+            hw = h * w
+            q = q.reshape(b, num_heads, head_dim, hw)  # b, nh, hd, hw
+            k = k.reshape(b, num_heads, head_dim, hw)  # b, nh, hd, hw
+            v = v.reshape(b, num_heads, head_dim, hw)  # b, nh, hd, hw
+
+            q = q.reshape(b * num_heads, head_dim, hw)  # b*nh, hd, hw
+            k = k.reshape(b * num_heads, head_dim, hw)  # b*nh, hd, hw
+            v = v.reshape(b * num_heads, head_dim, hw)  # b*nh, hd, hw
+
+            # q: (b*nh, hd, hw) -> permute -> (b*nh, hw, hd)
+            q = q.permute(0, 2, 1)  # b*nh, hw, hd
+            # k: (b*nh, hd, hw)
+            w_ = torch.bmm(q, k)    # b*nh, hw, hw
+            w_ = w_ * (head_dim ** (-0.5))
+            w_ = torch.nn.functional.softmax(w_, dim=2)
+
+            # attend to values
+            w_ = w_.permute(0, 2, 1)  # b*nh, hw, hw
+            h_ = torch.bmm(v, w_)     # b*nh, hd, hw
+
+            # Reshape back: (b*nh, hd, hw) -> (b, nh, hd, hw) -> (b, c, hw) -> (b, c, h, w)
+            h_ = h_.reshape(b, num_heads, head_dim, hw)
+            h_ = h_.reshape(b, c, h, w)
 
         h_ = self.proj_out(h_)
 
@@ -201,6 +236,7 @@ class Model(nn.Module):
         resolution = config.data.image_size
         resamp_with_conv = config.model.resamp_with_conv
         num_timesteps = config.diffusion.num_diffusion_timesteps
+        num_heads = getattr(config.model, 'num_heads', 1)
         
         if config.model.type == 'bayesian':
             self.logvar = nn.Parameter(torch.zeros(num_timesteps))
@@ -211,6 +247,7 @@ class Model(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
         self.in_channels = in_channels
+        self.num_heads = num_heads
 
         # timestep embedding
         self.temb = nn.Module()
@@ -244,7 +281,7 @@ class Model(nn.Module):
                                          dropout=dropout))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(AttnBlock(block_in))
+                    attn.append(AttnBlock(block_in, num_heads=num_heads))
             down = nn.Module()
             down.block = block
             down.attn = attn
@@ -259,7 +296,7 @@ class Model(nn.Module):
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
                                        dropout=dropout)
-        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.attn_1 = AttnBlock(block_in, num_heads=num_heads)
         self.mid.block_2 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
@@ -281,7 +318,7 @@ class Model(nn.Module):
                                          dropout=dropout))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(AttnBlock(block_in))
+                    attn.append(AttnBlock(block_in, num_heads=num_heads))
             up = nn.Module()
             up.block = block
             up.attn = attn
