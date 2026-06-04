@@ -69,3 +69,11 @@ __pycache__/
 # Training artifacts
 logs/
 samples/
+
+# Demo outputs (not tracked)
+demo/outputs/
+demo/__pycache__/
+
+# Whitelist demo README
+!demo/README_demo.md
+!Overview.png
