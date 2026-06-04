@@ -21,9 +21,11 @@ WARNING: Do NOT use the 2.5D checkpoint for this mode.
 
 import os
 import sys
+import re
 import time
 import math
 from types import SimpleNamespace
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -43,6 +45,104 @@ if _PROJECT_ROOT not in sys.path:
 from models.diffusion import Model
 from models.ema import EMAHelper
 from functions.denoising import sg_generalized_steps, sg_ddpm_steps
+
+
+# ============================================================================
+# PNG Sample Folder Scanner
+# ============================================================================
+
+# Supported naming patterns for LD/FD pair detection:
+#   {patient}_{slice}_ld.png  /  {patient}_{slice}_fd.png
+#   {patient}_{slice}_LD.png  /  {patient}_{slice}_FD.png
+# Also matches filenames with "low" / "full" variants.
+
+_LD_SUFFIX_RE = re.compile(r"^(.+?)_(ld|low)\.png$", re.IGNORECASE)
+_FD_SUFFIX_RE = re.compile(r"^(.+?)_(fd|full)\.png$", re.IGNORECASE)
+
+
+def scan_png_sample_folder(folder_path: str) -> list:
+    """
+    Recursively scan a PNG sample folder and detect LD/FD pairs.
+
+    Expected naming convention (case-insensitive):
+        {patient_id}_{slice_idx}_ld.png  ↔  {patient_id}_{slice_idx}_fd.png
+
+    The scanner searches all subdirectories recursively.
+
+    Args:
+        folder_path: root directory to scan.
+
+    Returns:
+        list of dicts sorted by (patient_id, slice_idx):
+        [{
+            "display_name": str,      # e.g. "C002_slice0"
+            "patient_id": str,
+            "slice_idx": int,
+            "ld_path": str,           # absolute path to LD PNG
+            "fd_path": str or None,   # absolute path to FD PNG (None if not found)
+        }, ...]
+    """
+    if not os.path.isdir(folder_path):
+        raise FileNotFoundError(f"PNG sample folder not found: {folder_path}")
+
+    # Collect all PNG files recursively
+    ld_files = {}   # key → path (key = stem without _ld suffix)
+    fd_files = {}   # key → path
+
+    for root, _dirs, files in os.walk(folder_path):
+        for fname in files:
+            if not fname.lower().endswith(".png"):
+                continue
+            fpath = os.path.join(root, fname)
+
+            ld_match = _LD_SUFFIX_RE.match(fname)
+            if ld_match:
+                key = ld_match.group(1).lower()
+                ld_files[key] = fpath
+                continue
+
+            fd_match = _FD_SUFFIX_RE.match(fname)
+            if fd_match:
+                key = fd_match.group(1).lower()
+                fd_files[key] = fpath
+
+    if not ld_files:
+        print(f"[PNG_SCAN] No LD PNG files found in: {folder_path}")
+        print(f"  Expected naming: *_ld.png or *_low.png")
+        return []
+
+    # Build paired samples
+    samples = []
+    for key, ld_path in ld_files.items():
+        fd_path = fd_files.get(key, None)
+
+        # Parse patient_id and slice_idx from key
+        # key format: "c002_0" or "c002_100" etc.
+        parts = key.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            patient_id = parts[0].upper()
+            slice_idx = int(parts[1])
+        else:
+            patient_id = key.upper()
+            slice_idx = 0
+
+        samples.append({
+            "display_name": f"{patient_id}_slice{slice_idx}",
+            "patient_id": patient_id,
+            "slice_idx": slice_idx,
+            "ld_path": ld_path,
+            "fd_path": fd_path,
+        })
+
+    # Sort by patient_id, then slice_idx
+    samples.sort(key=lambda s: (s["patient_id"], s["slice_idx"]))
+
+    n_paired = sum(1 for s in samples if s["fd_path"] is not None)
+    n_patients = len(set(s["patient_id"] for s in samples))
+    print(f"[PNG_SCAN] Found {len(samples)} LD images, {n_paired} with FD pairs, "
+          f"{n_patients} patients in: {folder_path}")
+
+    return samples
 
 
 # ============================================================================

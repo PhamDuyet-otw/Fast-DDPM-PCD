@@ -57,7 +57,8 @@ python demo/app_gradio.py \
     --port 7860          # Server port
     --device cuda        # cuda or cpu
     --png_config configs/ldfd_linear.yml        # Default PNG config
-    --png_ckpt path/to/png_ckpt.pth             # Default PNG checkpoint
+    --png_ckpt D:/B3/Thesis/Fast-DDPM/pretrained_models/ckpt_LDFDCT.pth  # Default PNG checkpoint
+    --png_sample_folder D:/B3/Thesis/Fast-DDPM/Fast-DDPM/data/LD_FD_CT_test  # Default PNG sample folder
     --v25d_config configs/ldfd_v3_2p5d_5090_full.yml  # Default 2.5D config
     --v25d_ckpt path/to/2p5d_ckpt.pth           # Default 2.5D checkpoint
 ```
@@ -77,15 +78,37 @@ All paths are also configurable in the Gradio UI at runtime.
 - No 2.5D, no HU windowing, no Dataset V3 logic
 
 ### Required paths
-1. **Config**: `configs/ldfd_linear.yml` (or your custom PNG config)
-2. **Checkpoint**: path to trained PNG model `.pth` file
+1. **Config**: `configs/ldfd_linear.yml`
+2. **Checkpoint**: `D:/B3/Thesis/Fast-DDPM/pretrained_models/ckpt_LDFDCT.pth`
+3. **Sample folder**: `D:/B3/Thesis/Fast-DDPM/Fast-DDPM/data/LD_FD_CT_test`
 
 ### How to use
 1. Enter config and checkpoint paths
 2. Click "Load PNG Model"
-3. Upload an LDCT PNG image
-4. Optionally upload an FDCT PNG for metric comparison
-5. Click "Run PNG Denoising"
+3. Enter PNG sample folder path and click "Load PNG Samples" to browse LD/FD pairs
+4. Select a sample from the dropdown, OR upload images manually
+5. Upload an LDCT PNG image
+6. Optionally upload an FDCT PNG for metric comparison
+7. Click "Run PNG Denoising"
+
+### Sample folder structure
+
+```
+The sample folder scanner expects this naming convention:
+  {patient_id}_{slice_idx}_ld.png  — low-dose
+  {patient_id}_{slice_idx}_fd.png  — full-dose
+
+Example structure:
+  LD_FD_CT_test/
+    C002/
+      C002_0_ld.png
+      C002_0_fd.png
+      C002_1_ld.png
+      C002_1_fd.png
+      ...
+    C050/
+      ...
+```
 
 ---
 

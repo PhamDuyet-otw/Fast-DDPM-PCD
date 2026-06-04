@@ -42,6 +42,7 @@ from demo.inference_png_original import (
     postprocess_to_numpy_01,
     postprocess_to_uint8,
     compute_metrics_png,
+    scan_png_sample_folder,
 )
 from demo.inference_2p5d_hu import (
     load_config_2p5d,
@@ -85,8 +86,12 @@ def parse_args():
     parser.add_argument("--png_config", type=str,
                         default="configs/ldfd_linear.yml",
                         help="Default PNG mode config path")
-    parser.add_argument("--png_ckpt", type=str, default="",
+    parser.add_argument("--png_ckpt", type=str,
+                        default="D:/B3/Thesis/Fast-DDPM/pretrained_models/ckpt_LDFDCT.pth",
                         help="Default PNG mode checkpoint path")
+    parser.add_argument("--png_sample_folder", type=str,
+                        default="D:/B3/Thesis/Fast-DDPM/Fast-DDPM/data/LD_FD_CT_test",
+                        help="Default PNG sample folder path")
     parser.add_argument("--v25d_config", type=str,
                         default="configs/ldfd_v3_2p5d_5090_full.yml",
                         help="Default 2.5D mode config path")
@@ -135,75 +140,147 @@ def load_png_model_fn(config_path, ckpt_path, device, state):
         return state, f"❌ Error loading PNG model:\n{str(e)}\n{traceback.format_exc()}"
 
 
-def run_png_denoising_fn(ld_image, fd_image, timesteps, scheduler_type,
-                         sample_type, state):
-    """Run PNG mode denoising."""
+def load_png_samples_fn(folder_path, state):
+    """Scan a PNG sample folder and detect LD/FD pairs."""
     try:
-        if state is None or "model" not in state:
-            return None, None, None, "❌ Please load the PNG model first."
+        if not folder_path.strip():
+            return state, [], "❌ Please provide a PNG sample folder path."
 
-        if ld_image is None:
-            return None, None, None, "❌ Please upload an LDCT PNG image."
+        if not os.path.isabs(folder_path):
+            folder_path = os.path.join(_PROJECT_ROOT, folder_path)
 
-        model = state["model"]
-        betas = state["betas"]
-        config = state["config"]
-        device = state["device"]
-        image_size = config.data.image_size
+        samples = scan_png_sample_folder(folder_path)
 
-        # Preprocess LDCT
-        ld_tensor = preprocess_png(ld_image, image_size)
+        if not samples:
+            return state, [], (
+                f"⚠️ No LD PNG files found in: {folder_path}\n"
+                "Expected naming: {{patient}}_{{slice}}_ld.png / _fd.png"
+            )
 
-        # Run inference
-        denoised_tensor, elapsed = run_inference_png(
-            model, betas, ld_tensor, device,
-            timesteps=int(timesteps),
-            scheduler_type=scheduler_type,
-            sample_type=sample_type,
+        if state is None:
+            state = {}
+        state["png_samples"] = samples
+
+        choices = [s["display_name"] for s in samples]
+        n_paired = sum(1 for s in samples if s["fd_path"] is not None)
+        n_patients = len(set(s["patient_id"] for s in samples))
+
+        return state, choices, (
+            f"✅ Found {len(samples)} LD images, {n_paired} with FD pairs\n"
+            f"   {n_patients} patients in: {folder_path}\n"
+            f"   Select a sample from the dropdown to run inference."
+        )
+    except Exception as e:
+        return state, [], f"❌ Error scanning folder:\n{str(e)}\n{traceback.format_exc()}"
+
+
+def _run_png_inference_core(ld_input, fd_input, timesteps, scheduler_type,
+                            sample_type, state, sample_label=""):
+    """
+    Core PNG denoising logic shared by manual upload and sample-folder modes.
+
+    ld_input/fd_input: PIL Image, file path str, or None.
+    """
+    if state is None or "model" not in state:
+        return None, None, None, "❌ Please load the PNG model first."
+    if ld_input is None:
+        return None, None, None, "❌ No LDCT input available."
+
+    model = state["model"]
+    betas = state["betas"]
+    config = state["config"]
+    device = state["device"]
+    image_size = config.data.image_size
+
+    # Preprocess LDCT
+    ld_tensor = preprocess_png(ld_input, image_size)
+
+    # Run inference
+    denoised_tensor, elapsed = run_inference_png(
+        model, betas, ld_tensor, device,
+        timesteps=int(timesteps),
+        scheduler_type=scheduler_type,
+        sample_type=sample_type,
+    )
+
+    # Post-process
+    denoised_01 = postprocess_to_numpy_01(denoised_tensor)
+    ld_01 = postprocess_to_numpy_01(ld_tensor)
+    denoised_img = arr_01_to_display(denoised_01)
+    ld_display = arr_01_to_display(ld_01)
+
+    # Metrics
+    metrics_text = ""
+    if sample_label:
+        metrics_text += f"🔬 Sample: {sample_label}\n"
+    metrics_text += f"⏱ Runtime: {elapsed:.2f}s\n"
+    metrics_text += f"📐 Timesteps: {timesteps}, Scheduler: {scheduler_type}\n"
+
+    fd_display = None
+    if fd_input is not None:
+        fd_tensor = preprocess_png(fd_input, image_size)
+        fd_01 = postprocess_to_numpy_01(fd_tensor)
+        fd_display = arr_01_to_display(fd_01)
+
+        metrics = compute_metrics_png(denoised_01, fd_01, ld_01)
+        metrics_text += (
+            f"\n📊 Metrics (vs Full-Dose):\n"
+            f"   Denoised PSNR: {metrics['denoised_psnr']:.4f} dB\n"
+            f"   Denoised SSIM: {metrics['denoised_ssim']:.4f}\n"
+        )
+        if "ld_psnr" in metrics:
+            metrics_text += (
+                f"\n📊 LD Baseline:\n"
+                f"   LD PSNR: {metrics['ld_psnr']:.4f} dB\n"
+                f"   LD SSIM: {metrics['ld_ssim']:.4f}\n"
+                f"\n📈 Improvement:\n"
+                f"   ΔPSNR: {metrics['delta_psnr']:+.4f} dB\n"
+                f"   ΔSSIM: {metrics['delta_ssim']:+.4f}"
+            )
+    else:
+        metrics_text += (
+            "\nℹ️ No FDCT ground truth provided.\n"
+            "   Upload an FDCT PNG to compute PSNR/SSIM."
         )
 
-        # Post-process
-        denoised_01 = postprocess_to_numpy_01(denoised_tensor)
-        ld_01 = postprocess_to_numpy_01(ld_tensor)
-        denoised_img = arr_01_to_display(denoised_01)
+    return ld_display, denoised_img, fd_display, metrics_text
 
-        # Prepare LD display
-        ld_display = arr_01_to_display(ld_01)
 
-        # Metrics
-        metrics_text = f"⏱ Runtime: {elapsed:.2f}s\n"
-        metrics_text += f"📐 Timesteps: {timesteps}, Scheduler: {scheduler_type}\n"
+def run_png_denoising_fn(ld_image, fd_image, timesteps, scheduler_type,
+                         sample_type, state):
+    """Run PNG mode denoising from manual image upload."""
+    try:
+        return _run_png_inference_core(
+            ld_image, fd_image, timesteps, scheduler_type,
+            sample_type, state
+        )
+    except Exception as e:
+        return None, None, None, f"❌ Error:\n{str(e)}\n{traceback.format_exc()}"
 
-        fd_display = None
-        if fd_image is not None:
-            # Preprocess FDCT for comparison
-            fd_tensor = preprocess_png(fd_image, image_size)
-            fd_01 = postprocess_to_numpy_01(fd_tensor)
-            fd_display = arr_01_to_display(fd_01)
 
-            metrics = compute_metrics_png(denoised_01, fd_01, ld_01)
-            metrics_text += (
-                f"\n📊 Metrics (vs Full-Dose):\n"
-                f"   Denoised PSNR: {metrics['denoised_psnr']:.4f} dB\n"
-                f"   Denoised SSIM: {metrics['denoised_ssim']:.4f}\n"
-            )
-            if "ld_psnr" in metrics:
-                metrics_text += (
-                    f"\n📊 LD Baseline:\n"
-                    f"   LD PSNR: {metrics['ld_psnr']:.4f} dB\n"
-                    f"   LD SSIM: {metrics['ld_ssim']:.4f}\n"
-                    f"\n📈 Improvement:\n"
-                    f"   ΔPSNR: {metrics['delta_psnr']:+.4f} dB\n"
-                    f"   ΔSSIM: {metrics['delta_ssim']:+.4f}"
-                )
-        else:
-            metrics_text += (
-                "\nℹ️ No FDCT ground truth provided.\n"
-                "   Upload an FDCT PNG to compute PSNR/SSIM."
-            )
+def run_png_from_sample_fn(sample_name, timesteps, scheduler_type,
+                           sample_type, state):
+    """Run PNG denoising from a selected sample in the folder scanner."""
+    try:
+        if state is None or "png_samples" not in state:
+            return None, None, None, "❌ Please load PNG samples from a folder first."
+        if not sample_name:
+            return None, None, None, "❌ Please select a sample from the dropdown."
 
-        return ld_display, denoised_img, fd_display, metrics_text
+        sample = None
+        for s in state["png_samples"]:
+            if s["display_name"] == sample_name:
+                sample = s
+                break
+        if sample is None:
+            return None, None, None, f"❌ Sample '{sample_name}' not found."
 
+        return _run_png_inference_core(
+            sample["ld_path"],
+            sample["fd_path"],  # May be None if no FD pair
+            timesteps, scheduler_type, sample_type, state,
+            sample_label=sample["display_name"],
+        )
     except Exception as e:
         return None, None, None, f"❌ Error:\n{str(e)}\n{traceback.format_exc()}"
 
@@ -504,7 +581,7 @@ def build_app(args):
                     png_ckpt_input = gr.Textbox(
                         label="PNG Checkpoint Path",
                         value=args.png_ckpt,
-                        placeholder="path/to/png_model/ckpt.pth",
+                        placeholder="D:/B3/Thesis/Fast-DDPM/pretrained_models/ckpt_LDFDCT.pth",
                         info="Trained checkpoint for the PNG/original model",
                     )
                     png_device = gr.Dropdown(
@@ -516,23 +593,33 @@ def build_app(args):
                         "🔄 Load PNG Model", variant="primary"
                     )
                     png_load_status = gr.Textbox(
-                        label="Status",
+                        label="Model Status",
                         lines=6,
                         interactive=False,
                         value="Model not loaded. Please provide config and checkpoint paths.",
                     )
 
                 with gr.Column(scale=1):
-                    gr.Markdown("#### 🖼️ Input Images")
-                    png_ld_upload = gr.Image(
-                        label="Upload LDCT PNG",
-                        type="pil",
-                        image_mode="L",
+                    gr.Markdown("#### 📁 PNG Sample Folder")
+                    png_sample_folder_input = gr.Textbox(
+                        label="PNG Sample Folder Path",
+                        value=args.png_sample_folder,
+                        placeholder="D:/B3/Thesis/Fast-DDPM/Fast-DDPM/data/LD_FD_CT_test",
+                        info="Folder with LD/FD PNG pairs (scanned recursively)",
                     )
-                    png_fd_upload = gr.Image(
-                        label="Upload FDCT PNG (optional, for metrics)",
-                        type="pil",
-                        image_mode="L",
+                    png_load_samples_btn = gr.Button(
+                        "📂 Load PNG Samples"
+                    )
+                    png_sample_dropdown = gr.Dropdown(
+                        label="Select Sample",
+                        choices=[],
+                        interactive=True,
+                        info="Auto-detected LD/FD pairs from sample folder",
+                    )
+                    png_sample_status = gr.Textbox(
+                        label="Sample Status",
+                        lines=3,
+                        interactive=False,
                     )
 
             with gr.Row():
@@ -552,8 +639,25 @@ def build_app(args):
                         choices=["generalized", "ddpm_noisy"],
                         value="generalized",
                     )
-                    png_run_btn = gr.Button(
-                        "▶️ Run PNG Denoising", variant="primary"
+                    with gr.Row():
+                        png_run_sample_btn = gr.Button(
+                            "▶️ Run on Selected Sample", variant="primary"
+                        )
+
+                with gr.Column(scale=1):
+                    gr.Markdown("#### 🖼️ Manual Upload (alternative)")
+                    png_ld_upload = gr.Image(
+                        label="Upload LDCT PNG",
+                        type="pil",
+                        image_mode="L",
+                    )
+                    png_fd_upload = gr.Image(
+                        label="Upload FDCT PNG (optional, for metrics)",
+                        type="pil",
+                        image_mode="L",
+                    )
+                    png_run_upload_btn = gr.Button(
+                        "▶️ Run on Uploaded Image", variant="secondary"
                     )
 
             gr.Markdown("#### 📊 Results")
@@ -575,7 +679,22 @@ def build_app(args):
                 outputs=[png_state, png_load_status],
             )
 
-            png_run_btn.click(
+            png_load_samples_btn.click(
+                fn=load_png_samples_fn,
+                inputs=[png_sample_folder_input, png_state],
+                outputs=[png_state, png_sample_dropdown, png_sample_status],
+            )
+
+            png_run_sample_btn.click(
+                fn=run_png_from_sample_fn,
+                inputs=[
+                    png_sample_dropdown, png_timesteps,
+                    png_scheduler, png_sample_type, png_state,
+                ],
+                outputs=[png_ld_output, png_dn_output, png_fd_output, png_metrics_output],
+            )
+
+            png_run_upload_btn.click(
                 fn=run_png_denoising_fn,
                 inputs=[
                     png_ld_upload, png_fd_upload, png_timesteps,
