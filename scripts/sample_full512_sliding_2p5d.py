@@ -483,6 +483,28 @@ def denoise_patch(model, condition_patch, seq, betas, device, eta=0.0):
 # Full-512 sliding-window inference
 # ---------------------------------------------------------------------------
 
+def _make_gaussian_weight_map(patch_size: int) -> np.ndarray:
+    """Build a 2D Gaussian weight map for sliding-window blending.
+
+    The weight is highest at the patch center and tapers smoothly toward
+    the edges (~3-sigma at the boundary). This reduces seam artifacts at
+    patch boundaries because the model's predictions are most reliable
+    in the center of each patch (where it has full receptive field context).
+
+    Args:
+        patch_size: Size of the (square) patch.
+
+    Returns:
+        Gaussian weight map of shape (patch_size, patch_size), values in (0, 1].
+    """
+    sigma = patch_size / 6.0  # ~3-sigma at the patch boundary
+    center = patch_size // 2
+    yy, xx = np.mgrid[0:patch_size, 0:patch_size]
+    d2 = (yy - center) ** 2 + (xx - center) ** 2
+    weight = np.exp(-d2 / (2.0 * sigma ** 2))
+    return weight.astype(np.float64)
+
+
 def infer_full_512(model, ld_triplet, seq, betas, device, patch_size=256,
                    overlap=128, eta=0.0):
     """
@@ -506,6 +528,7 @@ def infer_full_512(model, ld_triplet, seq, betas, device, patch_size=256,
 
     output_sum = np.zeros((img_h, img_w), dtype=np.float64)
     weight_map = np.zeros((img_h, img_w), dtype=np.float64)
+    gaussian_weight = _make_gaussian_weight_map(patch_size)
 
     ld_tensor = torch.from_numpy(ld_triplet).float()  # [3, H, W]
 
@@ -529,9 +552,9 @@ def infer_full_512(model, ld_triplet, seq, betas, device, patch_size=256,
         denoised = denoise_patch(model, cond_patch, seq, betas, device, eta=eta)
         denoised_np = denoised.squeeze().cpu().numpy()  # [256, 256]
 
-        # Accumulate
-        output_sum[y:y + patch_size, x:x + patch_size] += denoised_np
-        weight_map[y:y + patch_size, x:x + patch_size] += 1.0
+        # Accumulate (Gaussian-weighted blending to reduce seam artifacts)
+        output_sum[y:y + patch_size, x:x + patch_size] += denoised_np * gaussian_weight
+        weight_map[y:y + patch_size, x:x + patch_size] += gaussian_weight
 
     # Average overlapping regions
     denoised_512 = output_sum / np.maximum(weight_map, 1e-8)

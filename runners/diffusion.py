@@ -357,10 +357,8 @@ class Diffusion(object):
                     self._debug_25d_logged = True
 
                 if ddp_is_main(args):
+                    logging.info(f"step: {step}, loss: {loss.item()}")
                     tb_logger.add_scalar("loss", loss.item(), global_step=step)
-                    if ddp_is_main(args):
-                        logging.info(f"step: {step}, loss: {loss.item()}")
-                        tb_logger.add_scalar("loss", loss.item(), global_step=step)
 
                 optimizer.zero_grad()
                 loss.backward()
