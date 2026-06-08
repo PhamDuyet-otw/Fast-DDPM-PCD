@@ -3,7 +3,7 @@
 #   - data.input_mode: "2d" (vs proposed "2.5d")
 #   - model.in_channels: 2 (vs proposed 4)
 #   - model.num_heads: 1 (vs proposed 4)
-#   - training.n_iters: 400000 (fixed for both models)
+#   - training.n_iters: 100000 (fixed for both models)
 # All other hyperparameters, dataset paths, HU windowing, batch size,
 # optimizer settings, etc. are IDENTICAL to the proposed config.
 data:

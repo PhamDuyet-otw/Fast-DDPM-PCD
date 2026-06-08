@@ -77,3 +77,13 @@ demo/__pycache__/
 # Whitelist demo README
 !demo/README_demo.md
 !Overview.png
+
+# Experiment outputs (large, generated)
+exp/
+test_outputs/
+runs/
+*.pth
+*.log
+
+# Local config
+.env

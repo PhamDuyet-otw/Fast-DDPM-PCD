@@ -754,6 +754,8 @@ def main():
 
     # Limit samples
     if args.max_samples > 0:
+        random.seed(args.seed)
+        random.shuffle(triplets) 
         triplets = triplets[:args.max_samples]
     print(f"[SAMPLES] Processing {len(triplets)} triplets")
 
