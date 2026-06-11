@@ -87,3 +87,14 @@ runs/
 
 # Local config
 .env
+
+# Demo: ignore large checkpoints and outputs
+demo/checkpoints/*.pth
+demo/checkpoints/*.ckpt
+demo/samples/
+demo/outputs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
