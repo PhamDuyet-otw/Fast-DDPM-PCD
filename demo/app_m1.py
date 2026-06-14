@@ -123,11 +123,7 @@ def denoise_m1(filepath, progress=gr.Progress(track_tqdm=False)):
     except Exception as e:
         return None, None, f"Error reading file: {e}"
 
-    status = (f"Loaded {info['format']} | "
-              f"shape: {info['original_shape']} -> {info['tensor_shape']} | "
-              f"HU range: [{info['hu_range'][0]:.0f}, {info['hu_range'][1]:.0f}]")
-    if info["warning"]:
-        status += f"\nWARNING: {info['warning']}"
+    status = ""
 
     input_display_arr = cond_tensor[0, 0].numpy()
     input_display = Image.fromarray(denormalize_to_uint8(input_display_arr))
@@ -152,7 +148,6 @@ def denoise_m1(filepath, progress=gr.Progress(track_tqdm=False)):
     output_arr = output_tensor[0, 0].cpu().numpy()
     output_display = Image.fromarray(denormalize_to_uint8(output_arr))
 
-    status += f"\nDenoised in {total_patches} patches | output: 512x512"
     return input_display, output_display, status
 
 
@@ -165,10 +160,7 @@ def display_input_only(filepath):
         return None, f"Error: {e}"
     input_arr = cond_tensor[0, 0].numpy()
     input_display = Image.fromarray(denormalize_to_uint8(input_arr))
-    info_text = (f"Format: {info['format']} | original: {info['original_shape']} | "
-                 f"HU: [{info['hu_range'][0]:.0f}, {info['hu_range'][1]:.0f}]")
-    if info["warning"]:
-        info_text += f"\nWARNING: {info['warning']}"
+    info_text = ""
     return input_display, info_text
 
 
@@ -176,7 +168,7 @@ with gr.Blocks(title="Low-dose CT Denoising (M1)", theme=gr.themes.Soft()) as de
     gr.Markdown(
         """
         # Low-dose CT Denoising
-        Proposed Model M1 - 2.5D + Multi-head + Sliding-window 512x512
+
         """
     )
 
@@ -206,7 +198,7 @@ with gr.Blocks(title="Low-dose CT Denoising (M1)", theme=gr.themes.Soft()) as de
             )
 
     with gr.Row():
-        run_btn = gr.Button("Run Denoising (M1, ~10-20s)", variant="primary", size="lg")
+        run_btn = gr.Button("Run Denoising", variant="primary", size="lg")
         clear_btn = gr.Button("Reset", size="lg")
 
     upload_file.change(
